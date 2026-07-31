@@ -1,0 +1,9 @@
+# Lock PawPal+ to a light theme so text stays dark and readable regardless of
+# the user's OS / Streamlit dark-mode setting. Matches the app's custom CSS.
+[theme]
+base = "light"
+primaryColor = "#6D5AE6"
+backgroundColor = "#F4F2FB"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#232338"
+font = "sans serif"

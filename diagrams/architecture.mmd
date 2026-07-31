@@ -1,0 +1,45 @@
+flowchart TD
+    %% ===== INPUT LAYER =====
+    User([" Pet Owner (human) "])
+    User -->|"adds pets & tasks"| UI["Streamlit UI (app.py)"]
+    User -->|"natural-language request<br/>e.g. '20 min before work'"| UI
+
+    %% ===== DATA STORE / BACKEND =====
+    Backend["PawPal+ Backend (pawpal_system.py)<br/>Owner · Pet · Task · Scheduler"]
+    UI <-->|"owner / pets / tasks"| Backend
+
+    %% ===== AI MODULE =====
+    subgraph AI["AI Pet Care Assistant (ai_pet_assistant.py)"]
+        direction TB
+        Guard{"GUARDRAILS<br/>empty input? no pets? no tasks?"}
+        Retriever["RETRIEVER / Context Builder<br/>build_task_context()<br/>pending tasks + conflicts"]
+        Agent["AGENT (LLM)<br/>Gemini generate_content()<br/>model: gemini-flash-latest"]
+        Evaluator{"EVALUATOR<br/>API error? blocked? empty text?"}
+    end
+
+    %% ===== PROCESS FLOW =====
+    UI -->|"user_request + Scheduler"| Guard
+    Backend -.->|"grounding data<br/>(real pets & tasks)"| Retriever
+    Guard -->|"invalid → safe message"| Output
+    Guard -->|"valid"| Retriever
+    Retriever -->|"grounded context + prompt"| Agent
+    Agent --> Evaluator
+    Evaluator -->|"failure → safe message"| Output
+    Evaluator -->|"ok → care plan"| Output
+
+    %% ===== OUTPUT LAYER =====
+    Output["OUTPUT<br/>Care Plan / Status Message"]
+    Output --> UI
+    UI -->|"displays plan"| User
+
+    %% ===== HUMAN + TESTING CHECKS (checking AI results) =====
+    User ==>|"reads plan, decides,<br/>marks tasks done"| HumanCheck["HUMAN-IN-THE-LOOP<br/>owner validates recommendation"]
+    Tester["TESTER (pytest)<br/>test_ai_pet_assistant.py<br/>fake client · no network"]
+    Tester ==>|"verify guardrails<br/>& data grounding"| AI
+    Agent -.->|"counts & outcomes<br/>(no secrets)"| Logs["Logging (pawpal.ai)"]
+
+    %% ===== STYLING =====
+    classDef human fill:#e8f4ff,stroke:#3b82f6,color:#111;
+    classDef check fill:#fff4e6,stroke:#f59e0b,color:#111;
+    class User,HumanCheck human;
+    class Tester,Evaluator,Guard,Logs check;
