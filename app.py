@@ -1,4 +1,6 @@
-from datetime import datetime
+import math
+import time
+from datetime import datetime, timedelta
 
 import streamlit as st
 
@@ -11,7 +13,11 @@ try:
 except ImportError:
     pass
 
-from ai_pet_assistant import generate_care_plan
+from ai_pet_assistant import (
+    INITIAL_COOLDOWN_SECONDS,
+    generate_care_plan,
+    next_cooldown_state,
+)
 from pawpal_system import Owner, Pet, PriorityLevel, Recurrence, Scheduler, Task
 
 # Map the UI's lowercase priority strings to the PriorityLevel enum.
@@ -239,13 +245,15 @@ h1, h2, h3, h4 { color: var(--text); font-weight: 600; }
 # Session state
 # ---------------------------------------------------------------------------
 if "owner" not in st.session_state:
-    st.session_state.owner = Owner(name="Jordan")
+    st.session_state.owner = Owner(name="")  # blank until the user fills it in
 if "page" not in st.session_state:
     st.session_state.page = "Owner"
 if "show_chat" not in st.session_state:
     st.session_state.show_chat = False
 if "chat" not in st.session_state:
     st.session_state.chat = []  # list of {"role": ..., "content": ...}
+if "pending" not in st.session_state:
+    st.session_state.pending = False  # a user message awaiting an AI reply
 
 owner: Owner = st.session_state.owner
 scheduler = Scheduler(owner)
@@ -260,6 +268,12 @@ NAV = [
 
 
 def _go(page: str) -> None:
+    # Require an owner name before leaving the Owner page. Check the live input
+    # value (updated before this callback runs), falling back to the owner.
+    name = st.session_state.get("owner_name_field", st.session_state.owner.name)
+    if page != "Owner" and not str(name).strip():
+        st.session_state.nav_blocked = True
+        return
     st.session_state.page = page
 
 
@@ -274,6 +288,18 @@ def _close_chat() -> None:
 def repeat_label(task: Task) -> str:
     """Human-friendly recurrence label for a table cell."""
     return "—" if task.recurrence is Recurrence.NONE else task.recurrence.value.title()
+
+
+WEEKDAYS = [
+    "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday",
+]
+
+
+def next_weekday(weekday_name: str):
+    """Return the next date (today or later) that falls on ``weekday_name``."""
+    target = WEEKDAYS.index(weekday_name)
+    today = datetime.now().date()
+    return today + timedelta(days=(target - today.weekday()) % 7)
 
 
 # ---------------------------------------------------------------------------
@@ -321,6 +347,10 @@ def page_header(title: str, subtitle: str) -> None:
 def render_owner() -> None:
     page_header("Dashboard", "Your pet-care command center")
 
+    if st.session_state.get("nav_blocked"):
+        st.warning("👋 Please enter the owner name first — it's needed before you can use the other pages.")
+        st.session_state.nav_blocked = False
+
     pets = owner.pets
     pending = scheduler.pending_tasks()
     conflicts = scheduler.conflicts()
@@ -340,9 +370,20 @@ def render_owner() -> None:
 
     with st.container(border=True):
         st.subheader("Owner")
-        owner_name = st.text_input("Owner name", value=owner.name)
-        owner.name = owner_name
-        st.caption("Your name is remembered while you use the app.")
+        # Restore the field from the saved owner name (in case it was cleared
+        # while navigating), then keep the owner in sync with what's typed.
+        if "owner_name_field" not in st.session_state:
+            st.session_state.owner_name_field = owner.name
+        st.text_input(
+            "Owner name",
+            key="owner_name_field",
+            placeholder="Enter your name to begin",
+        )
+        owner.name = st.session_state.owner_name_field.strip()
+        if not owner.name:
+            st.caption("⬆️ Enter your name to unlock the rest of PawPal+.")
+        else:
+            st.caption("Your name is remembered while you use the app.")
 
     if pets:
         chips = "".join(
@@ -402,9 +443,24 @@ def render_schedule_task() -> None:
             task_time = st.time_input("Time")
             repeat = st.selectbox("Repeat", list(RECURRENCE_BY_LABEL.keys()))
 
+        # The day field adapts to how the task repeats:
+        #   none   -> a specific date (one-off)
+        #   weekly -> a day of the week (repeats on that weekday)
+        #   daily  -> no date needed (starts today, every day)
+        recurrence = RECURRENCE_BY_LABEL[repeat]
+        if recurrence is Recurrence.NONE:
+            task_date = st.date_input("Date", value=datetime.now().date())
+        elif recurrence is Recurrence.WEEKLY:
+            weekday = st.selectbox("Day of week", WEEKDAYS)
+            task_date = next_weekday(weekday)
+            st.caption(f"Repeats every {weekday}, starting {task_date:%b %d}.")
+        else:  # DAILY
+            task_date = datetime.now().date()
+            st.caption("Repeats every day — starts today at the time above.")
+
         if st.button("Add task", type="primary"):
             pet = next(pet for pet in owner.pets if pet.name == pet_choice)
-            scheduled = datetime.combine(datetime.now().date(), task_time)
+            scheduled = datetime.combine(task_date, task_time)
             pet.add_task(
                 Task(
                     title=task_title,
@@ -434,6 +490,7 @@ def render_today() -> None:
         st.table(
             [
                 {
+                    "Date": task.scheduled_time.strftime("%a %b %d"),
                     "Time": task.scheduled_time.strftime("%H:%M"),
                     "Priority": task.priority.value.title(),
                     "Pet": pet.name,
@@ -447,7 +504,7 @@ def render_today() -> None:
 
         st.markdown("**Mark a task done**")
         task_by_label = {
-            f"{task.scheduled_time.strftime('%H:%M')} · {pet.name}: {task.title}": task
+            f"{task.scheduled_time.strftime('%b %d %H:%M')} · {pet.name}: {task.title}": task
             for pet, task in upcoming
         }
         done_col, btn_col = st.columns([4, 1])
@@ -494,6 +551,7 @@ def render_browse() -> None:
             st.table(
                 [
                     {
+                        "Date": task.scheduled_time.strftime("%a %b %d"),
                         "Time": task.scheduled_time.strftime("%H:%M"),
                         "Priority": task.priority.value.title(),
                         "Pet": pet_by_id[task.id].name,
@@ -523,6 +581,8 @@ PAGES.get(st.session_state.page, render_owner)()
 _STATUS_STYLE = {
     "ok": st.success,
     "empty_input": st.info,
+    "too_long": st.warning,
+    "medical": st.error,
     "no_pets": st.info,
     "no_tasks": st.info,
     "unavailable": st.warning,
@@ -549,6 +609,20 @@ if st.session_state.show_chat:
         for msg in st.session_state.chat:
             st.chat_message(msg["role"]).markdown(msg["content"])
 
+        # Second phase: a user message is already shown above; now process it
+        # with a visible "thinking" bubble, then store the reply and rerun.
+        if st.session_state.pending:
+            prompt = st.session_state.chat[-1]["content"]
+            history = st.session_state.chat[:-1]  # prior turns give it memory
+            with st.chat_message("assistant"):
+                with st.spinner("Thinking about your pets…"):
+                    result = generate_care_plan(prompt, scheduler, history=history)
+            st.session_state.chat.append(
+                {"role": "assistant", "content": result.message}
+            )
+            st.session_state.pending = False
+            st.rerun()
+
         with st.form("ai_chat_form", clear_on_submit=True):
             prompt = st.text_area(
                 "Message", label_visibility="collapsed",
@@ -556,11 +630,26 @@ if st.session_state.show_chat:
             )
             send = st.form_submit_button("Send", type="primary", use_container_width=True)
 
+        # First phase: record the user's message (and either queue it for the AI
+        # or reject it on cooldown), then rerun so the message shows immediately.
         if send:
             st.session_state.chat.append({"role": "user", "content": prompt})
-            with st.spinner("Thinking about your pets…"):
-                result = generate_care_plan(prompt, scheduler)
-            st.session_state.chat.append({"role": "assistant", "content": result.message})
+            allowed, last_t, cooldown, wait = next_cooldown_state(
+                st.session_state.get("ai_last_time"),
+                st.session_state.get("ai_cooldown", INITIAL_COOLDOWN_SECONDS),
+                time.time(),
+            )
+            st.session_state.ai_last_time = last_t
+            st.session_state.ai_cooldown = cooldown
+
+            if not allowed:
+                st.session_state.chat.append({
+                    "role": "assistant",
+                    "content": f"⏳ You're sending messages too fast. Please wait "
+                    f"about {math.ceil(wait)} second(s) and try again.",
+                })
+            else:
+                st.session_state.pending = True
             st.rerun()
 
 # The floating button itself (toggles the panel).

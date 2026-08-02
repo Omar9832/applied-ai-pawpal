@@ -32,6 +32,12 @@ reasoned care plan or a direct answer.
 - **Single-provider dependency.** It relies on the Gemini API being reachable. When
   the API is down or rate-limited, the feature is unavailable (though it fails
   safely — see below).
+- **Free-tier quota limit.** On the free tier this project's key allows only ~20
+  requests/day on `gemini-flash-latest` (and a small per-minute cap). Heavy use
+  exhausts the daily quota and the assistant returns a "reached its free usage
+  limit" message until the quota resets (or billing is enabled). This is an
+  operational limit of the free API tier, not a defect — but it caps real-world
+  usage without a paid key.
 - **Language and cultural bias.** Prompts and answers are English-only, and the
   model's notion of "normal" pet care reflects its training data, which may not
   match every owner's routine, region, or type of animal.

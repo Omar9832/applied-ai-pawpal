@@ -1,3 +1,7 @@
+# Hide the built-in "Deploy" button but keep the settings (⋮) menu.
+[client]
+toolbarMode = "viewer"
+
 # Lock PawPal+ to a light theme so text stays dark and readable regardless of
 # the user's OS / Streamlit dark-mode setting. Matches the app's custom CSS.
 [theme]

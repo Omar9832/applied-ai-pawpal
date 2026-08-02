@@ -8,8 +8,13 @@ mimics the Anthropic Messages response shape.
 from __future__ import annotations
 
 from datetime import datetime
-
-from ai_pet_assistant import build_task_context, generate_care_plan
+from ai_pet_assistant import (
+    INITIAL_COOLDOWN_SECONDS,
+    _is_care_request,
+    build_task_context,
+    generate_care_plan,
+    next_cooldown_state,
+)
 from pawpal_system import Owner, Pet, PriorityLevel, Scheduler, Task
 
 
@@ -97,6 +102,73 @@ def test_no_pending_tasks_is_handled() -> None:
     scheduler = make_scheduler(pet)  # pet has no tasks
     result = generate_care_plan("what now?", scheduler, client=FakeClient())
     assert result.status == "no_tasks"
+
+
+def test_over_long_input_is_rejected() -> None:
+    scheduler = make_scheduler(pet_with_task())
+    client = FakeClient()
+    result = generate_care_plan("x" * 1001, scheduler, client=client)
+    assert result.status == "too_long"
+    assert client.models.calls == []  # rejected before any API call
+
+
+def test_medical_question_is_deflected() -> None:
+    scheduler = make_scheduler(pet_with_task())
+    client = FakeClient()
+    result = generate_care_plan(
+        "My dog is bleeding and won't eat!", scheduler, client=client
+    )
+    assert result.status == "medical"
+    assert "vet" in result.message.lower()
+    assert client.models.calls == []  # deflected before any API call
+
+
+def test_cooldown_escalates_and_resets() -> None:
+    # First request is always allowed and starts at the initial cooldown.
+    allowed, _, cooldown, wait = next_cooldown_state(None, INITIAL_COOLDOWN_SECONDS, 100.0)
+    assert allowed is True
+    assert cooldown == INITIAL_COOLDOWN_SECONDS
+    assert wait == 0.0
+
+    # Sending again immediately -> blocked, cooldown grows, wait is reported.
+    allowed, _, grown, wait = next_cooldown_state(100.0, INITIAL_COOLDOWN_SECONDS, 100.5)
+    assert allowed is False
+    assert grown > INITIAL_COOLDOWN_SECONDS  # escalated
+    assert wait > 0
+
+    # Waiting past the (grown) cooldown -> allowed again and reset to initial.
+    allowed, _, reset, wait = next_cooldown_state(100.0, grown, 100.0 + grown + 1)
+    assert allowed is True
+    assert reset == INITIAL_COOLDOWN_SECONDS
+
+
+def test_history_is_included_in_prompt() -> None:
+    scheduler = make_scheduler(pet_with_task())
+    client = FakeClient()
+    history = [
+        {"role": "user", "content": "Which tasks are urgent?"},
+        {"role": "assistant", "content": "Rex's Morning walk is high priority."},
+    ]
+    generate_care_plan("why?", scheduler, history=history, client=client)
+    sent = client.models.calls[0]["contents"]
+    assert "Which tasks are urgent?" in sent  # prior turn carried into the prompt
+
+
+def test_greeting_is_not_blocked_by_guardrails() -> None:
+    # A greeting with no pets should still reach the model, not the canned
+    # "add a pet first" message.
+    scheduler = make_scheduler()  # no pets
+    result = generate_care_plan("hey, how are you?", scheduler, client=FakeClient())
+    assert result.status == "ok"
+
+
+def test_care_intent_classification() -> None:
+    scheduler = make_scheduler(pet_with_task())
+    assert _is_care_request("what should I do for my pets?", scheduler) is True
+    assert _is_care_request("I have 20 minutes before work", scheduler) is True
+    assert _is_care_request("what does Rex need today?", scheduler) is True  # pet name
+    assert _is_care_request("how are you doing?", scheduler) is False
+    assert _is_care_request("hello there", scheduler) is False
 
 
 def test_api_error_is_caught_not_raised() -> None:

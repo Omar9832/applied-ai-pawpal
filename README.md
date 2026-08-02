@@ -224,6 +224,105 @@ did **not** crash — it logged the failure and showed:
 
 ---
 
+## ✅ Reproducible Execution Evidence
+
+Everything below is copied from **real runs** so the system can be graded without a
+video. It demonstrates an end-to-end run, the AI feature behavior, and the
+reliability/guardrail behavior — each input paired with its actual output. Demo
+data throughout: owner **Sam** with **Rex** (dog) and **Mochi** (cat), including an
+intentional 08:00 scheduling conflict (from `python main.py` / `build_demo()`).
+
+### A. Automated tests
+
+```text
+$ python -m pytest -q
+..................                                                       [100%]
+18 passed in 0.04s
+```
+
+### B. End-to-end engine run (CLI)
+
+```text
+$ python main.py
+Today's Schedule for Sam
+========================================
+08:00  [URGENT]  Mochi: Feed (10 min)
+08:00  [HIGH  ]  Rex: Morning walk (30 min)
+18:00  [URGENT]  Rex: Dinner (10 min)
+20:00  [MEDIUM]  Mochi: Litter cleanup (15 min)
+
+Heads up - 1 scheduling conflict(s):
+  - Mochi: Feed (08:00) overlaps Rex: Morning walk (08:00)
+```
+
+### C. AI feature behavior — grounded, adaptive replies
+
+Real replies from the Gemini-backed assistant. Note it **matches the answer to the
+question** and stays grounded in the actual pets/tasks (it does not invent a pet):
+
+```text
+INPUT : "How many pets do I have?"
+OUTPUT: You have 2 pets: Rex and Mochi.                        (direct data answer)
+
+INPUT : "I have 20 minutes, what should I do?"
+OUTPUT: Here is your 20-minute plan:
+        1. Mochi | Feed | 10 min | 08:00
+        Why this order: Mochi's feeding is URGENT and fits your 20-minute window.
+        What to defer: Rex's Morning walk (30 min).           (plan + time budget)
+
+INPUT : "What should I do for my parrot Kiwi?"
+OUTPUT: You don't have a parrot named Kiwi listed in PawPal+
+        (your registered pets are Rex and Mochi)...            (grounding, no hallucination)
+
+INPUT : "How are you doing?"
+OUTPUT: I'm doing great, thanks for asking! I'm here and ready
+        to help you manage Rex and Mochi's care today.         (small talk, no forced plan)
+```
+
+### D. Reliability / guardrail behavior (deterministic — runs with no API key)
+
+```text
+[Empty input] input='   '
+  status=empty_input
+  reply=Tell me what you need — for example, "I have 20 minutes before work..."
+
+[No pets] input='what should I do?'
+  status=no_pets
+  reply=There are no pets in PawPal+ yet. Add a pet first and I can help you plan their care.
+
+[Over-long input] input='xxxx... (1001 chars)'
+  status=too_long
+  reply=That message is a bit long for me — please keep it under 1000 characters and try again.
+
+[Medical/emergency] input='My dog is bleeding, help!'
+  status=medical
+  reply=⚠️ I'm a pet-care scheduling assistant, not a vet — I can't help with health
+        problems or emergencies. Please contact your veterinarian right away...
+
+[Escalating rate limit]
+  1st send: allowed=True  cooldown=3s
+  spam #1 : allowed=False -> wait ~6s  (cooldown grew to 6s)
+  spam #2 : allowed=False -> wait ~12s (cooldown grew to 12s)
+```
+
+### E. AI/API error handling (real quota event)
+
+During testing the Gemini **free-tier daily quota was exhausted**, so the API
+returned HTTP `429 RESOURCE_EXHAUSTED`. The assistant caught it and returned a safe,
+specific message instead of crashing:
+
+```text
+INPUT : "I have 20 minutes, what should I do?"   (while quota exhausted)
+OUTPUT: The AI assistant has reached its free usage limit for now. Please wait a
+        little and try again — the free quota resets over time (or add billing to
+        your Gemini API key for higher limits).
+```
+
+**Coverage:** ✅ end-to-end run (A, B) · ✅ AI feature behavior (C) · ✅
+reliability/guardrails (D, E) · ✅ clear output for every case.
+
+---
+
 ## 🧠 Design Decisions & Trade-offs
 
 | Decision | Why | Trade-off |
@@ -321,6 +420,22 @@ safely" has to be designed in from the start, not bolted on.
 > 📄 **The full graded responsible-AI reflection** — how I collaborated with AI,
 > one helpful and one flawed AI suggestion, and the system's limitations — lives in
 > [`model_card.md`](model_card.md).
+
+### What this project says about me as an AI engineer
+
+This project shows that I treat an LLM as one component inside a real system, not as
+a magic box. Rather than bolting a generic chatbot onto the app, I grounded the
+assistant in the application's actual data so every answer is tied to the user's real
+pets and tasks, and I built the reliability layer that production AI needs —
+deterministic guardrails for empty input, missing data, over-long or medical
+requests, an escalating rate limit, and safe handling of API errors and quota
+limits — all covered by an offline, dependency-injected test suite so the behavior
+is *proven*, not assumed. When the model I chose was retired and my free-tier quota
+ran out mid-project, I diagnosed the real causes and adapted (swapping providers and
+models, surfacing clear error messages) instead of hiding the failures. I care about
+the parts of AI engineering that decide whether a feature is trustworthy: grounding,
+guardrails, graceful degradation, honest error reporting, and testing — and I can
+integrate all of that into an existing codebase without breaking what already works.
 
 ---
 

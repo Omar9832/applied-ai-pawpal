@@ -32,39 +32,62 @@ from pawpal_system import Recurrence, Scheduler
 logger = logging.getLogger("pawpal.ai")
 
 # Default model — a fast, low-cost Gemini model well suited to a student demo.
-# "gemini-flash-latest" is a stable alias that always tracks the current Flash
-# model, so it won't break when a specific dated version is retired.
+# "gemini-flash-latest" tracks the current Flash model and is the one with free-
+# tier availability on this project's key (~20 requests/day). Note: the free tier
+# is small, so heavy use can hit a daily quota (handled gracefully below).
 DEFAULT_MODEL = "gemini-flash-latest"
 
 # Environment variable the Gemini SDK / this module reads the key from.
 API_KEY_ENV = "GEMINI_API_KEY"
 
+# Reject requests longer than this (guards against cost blow-ups and abuse).
+MAX_REQUEST_CHARS = 1000
+
+# Per-session escalating cooldown: a short initial gap between requests that
+# grows the more the user spams, and resets once they wait it out.
+INITIAL_COOLDOWN_SECONDS = 3.0
+MAX_COOLDOWN_SECONDS = 30.0
+COOLDOWN_GROWTH = 2.0
+
+# Symptom / emergency terms that should trigger a "see a vet" disclaimer instead
+# of a scheduling answer. Deliberately excludes "medication"/"medicine", which
+# are legitimate scheduled care tasks the owner may ask about.
+MEDICAL_KEYWORDS = (
+    "emergency", "bleeding", "vomit", "throw up", "diarrhea", "seizure",
+    "poison", "choking", "not breathing", "unconscious", "collaps",
+    "not eating", "won't eat", "wont eat", "dying", "overdose", "in pain",
+    "injured", "wound", "swollen", "sick", "hurt", "fever", "lethargic",
+    "trembling", "limping",
+)
+
 # How the assistant should behave. Sent as the model's system instruction; the
 # volatile per-request data goes in the user message.
 SYSTEM_PROMPT = """You are the AI Pet Care Assistant built into PawPal+, a pet \
-care planning app. You help a busy pet owner decide what to do for their pets \
-right now, using ONLY the pets and scheduled tasks provided to you.
+care planning app. You are friendly and concise, and you ground every answer in \
+ONLY the pets and scheduled tasks you are given. Never invent pets, tasks, or \
+times that are not listed.
 
-Rules:
-- Base every recommendation on the actual pets and tasks in the data. Never \
-invent pets, tasks, or times that are not listed.
-- Respect the owner's stated constraints (such as how many minutes they have). \
-Add up task durations and recommend the set that fits, prioritizing URGENT and \
-HIGH tasks and anything time-sensitive.
-- If the owner mentions a pet that is not in the data, say so plainly and list \
-the pets they actually have.
-- If a scheduling conflict is noted in the data, mention it and suggest how to \
-handle it.
-- Match your answer to what the owner actually asked:
-  - When they ask what to do, what to prioritize, or give a time constraint \
-(e.g. "I have 20 minutes"), reply with a short, friendly, actionable PLAN: an \
-ordered list of what to do (pet name, task, rough minutes, and time), a one-line \
-reason for the ordering, and — if relevant — what to safely skip or defer.
-  - For any other question (e.g. "when is Rex's dinner?", "does anything clash \
-today?", "how long will grooming take?", "which tasks are urgent?"), answer \
-DIRECTLY and concisely from the data. Do NOT force the ordered-plan format when \
-it doesn't fit the question.
-- Keep every answer concise, friendly, and grounded only in the data above."""
+Choose your reply style from what the owner actually said:
+1. GREETING or SMALL TALK ("hi", "how are you?", "thanks"): reply warmly in one \
+or two sentences. Do NOT list tasks or produce a plan.
+2. OFF-TOPIC (not about their pets or schedule): give a brief, friendly reply, \
+then gently remind them you're their pet-care assistant. Do NOT produce a plan.
+3. DIRECT QUESTION about the data ("which tasks are urgent?", "when is Rex's \
+dinner?", "how many pets do I have?"): answer directly and concisely from the \
+data. Do NOT produce a full plan.
+4. PLANNING REQUEST — what to do, what to prioritize, or a time constraint ("I \
+have 20 minutes, what should I do?"): reply with a short PLAN — an ordered list \
+(pet, task, minutes, time), a one-line reason for the ordering, and, if useful, \
+what to safely defer. Respect stated time limits by adding up durations and \
+favoring URGENT/HIGH tasks.
+
+Also:
+- If the owner mentions a pet that is not in the data, say so and list their \
+actual pets.
+- If there are no pets or no tasks yet, say so briefly and invite them to add \
+some — but still answer greetings and small talk normally.
+- If the data notes a scheduling conflict, mention it when it's relevant.
+Keep every reply concise, friendly, and grounded only in the data above."""
 
 
 @dataclass
@@ -74,6 +97,8 @@ class CarePlanResult:
     ``status`` lets the UI choose how to present the message:
     - ``"ok"``            – a real AI-generated plan
     - ``"empty_input"``   – the owner submitted nothing
+    - ``"too_long"``      – the request exceeded ``MAX_REQUEST_CHARS``
+    - ``"medical"``       – a health/emergency question was deflected to a vet
     - ``"no_pets"``       – there are no pets yet
     - ``"no_tasks"``      – there are pets but nothing pending
     - ``"unavailable"``   – the AI backend isn't set up (missing package/key)
@@ -131,21 +156,93 @@ def build_task_context(scheduler: Scheduler) -> str:
     return "\n".join(lines)
 
 
-def _build_user_message(user_request: str, context: str) -> str:
-    """Combine the grounded PawPal+ data with the owner's question."""
-    return (
-        "Here is the current PawPal+ data:\n\n"
-        f"{context}\n\n"
-        "The owner says:\n"
-        f'"{user_request.strip()}"\n\n'
-        "Give a prioritized, actionable plan based only on the data above."
+def _build_user_message(
+    user_request: str, context: str, history: list | None = None
+) -> str:
+    """Combine the grounded PawPal+ data, recent chat, and the owner's message.
+
+    ``history`` is an optional list of ``{"role", "content"}`` turns so the model
+    can resolve follow-ups like "why?" — only the last few are included to keep
+    the prompt small.
+    """
+    sections = [f"Here is the current PawPal+ data:\n\n{context}"]
+
+    if history:
+        lines = []
+        for msg in history[-6:]:
+            role = msg.get("role") if isinstance(msg, dict) else None
+            content = msg.get("content", "") if isinstance(msg, dict) else str(msg)
+            who = "Owner" if role == "user" else "Assistant"
+            lines.append(f"{who}: {content}")
+        sections.append("Recent conversation (for context):\n" + "\n".join(lines))
+
+    sections.append(
+        f'The owner now says:\n"{user_request.strip()}"\n\n'
+        "Reply in the most appropriate style, using only the data above."
     )
+    return "\n\n".join(sections)
+
+
+# Keywords that signal the owner is actually asking about pet care / scheduling,
+# rather than making small talk or asking something unrelated. Used only to
+# decide whether the "no pets" / "no tasks" shortcuts should fire — a deliberately
+# conservative heuristic so basic conversation is never blocked.
+_CARE_KEYWORDS = (
+    "pet", "dog", "cat", "puppy", "kitten", "walk", "feed", "food", "task",
+    "schedule", "plan", "priorit", "urgent", "care", "groom", "litter", "vet",
+    "medic", "dinner", "conflict", "overlap", "double-book", "due", "help",
+    "what should i do", "what do i do", "what now", "to do", "minute",
+)
+
+
+def _is_care_request(user_request: str, scheduler: Scheduler) -> bool:
+    """Rough check: is the owner asking about their pets or schedule?
+
+    Greetings and unrelated questions return ``False`` so they aren't answered
+    with a canned "add a pet first" message.
+    """
+    text = user_request.casefold()
+    if any(word in text for word in _CARE_KEYWORDS):
+        return True
+    return any(pet.name and pet.name.casefold() in text for pet in scheduler.pets)
+
+
+def _is_medical_or_emergency(user_request: str) -> bool:
+    """True if the request looks like a health/emergency question for a vet."""
+    text = user_request.casefold()
+    return any(word in text for word in MEDICAL_KEYWORDS)
+
+
+def next_cooldown_state(
+    last_time: float | None,
+    cooldown: float,
+    now: float,
+) -> tuple[bool, float, float, float]:
+    """Escalating per-session cooldown between AI requests.
+
+    Given the previous request's time (``last_time``, ``None`` if this is the
+    first), the current required gap (``cooldown``), and the current time
+    (``now``), return ``(allowed, new_last_time, new_cooldown, wait_seconds)``:
+
+    - If enough time has passed (or it's the first request), the request is
+      allowed and the cooldown resets to ``INITIAL_COOLDOWN_SECONDS``.
+    - Otherwise it's blocked, the cooldown grows by ``COOLDOWN_GROWTH`` (capped at
+      ``MAX_COOLDOWN_SECONDS``), and ``wait_seconds`` says how long to wait.
+
+    Pure and time-injected so it is easy to unit-test.
+    """
+    if last_time is None or now - last_time >= cooldown:
+        return True, now, INITIAL_COOLDOWN_SECONDS, 0.0
+    new_cooldown = min(cooldown * COOLDOWN_GROWTH, MAX_COOLDOWN_SECONDS)
+    wait = new_cooldown - (now - last_time)
+    return False, now, new_cooldown, wait
 
 
 def generate_care_plan(
     user_request: str,
     scheduler: Scheduler,
     *,
+    history: list | None = None,
     client=None,
     model: str = DEFAULT_MODEL,
 ) -> CarePlanResult:
@@ -164,8 +261,37 @@ def generate_care_plan(
             '"I have 20 minutes before work, what should I do for my pets?"',
         )
 
+    text = user_request.strip()
+
+    # --- Guardrail 2: request too long (cost / abuse guard) ------------------
+    if len(text) > MAX_REQUEST_CHARS:
+        logger.info("care_plan: rejected over-long request (%d chars)", len(text))
+        return CarePlanResult(
+            "too_long",
+            f"That message is a bit long for me — please keep it under "
+            f"{MAX_REQUEST_CHARS} characters and try again.",
+        )
+
+    # --- Guardrail 3: medical / emergency questions -------------------------
+    # Safety: this is a scheduling assistant, not a vet. Deflect health and
+    # emergency questions to a professional rather than answering them.
+    if _is_medical_or_emergency(text):
+        logger.warning("care_plan: medical/emergency request deflected")
+        return CarePlanResult(
+            "medical",
+            "⚠️ I'm a pet-care *scheduling* assistant, not a vet — I can't help "
+            "with health problems or emergencies. If your pet may be sick, hurt, "
+            "or in danger, please contact your veterinarian right away, or an "
+            "emergency animal hospital / pet poison helpline.",
+        )
+
+    # Only apply the "no pets" / "no tasks" shortcuts when the owner is actually
+    # asking for care help — greetings and basic questions still reach the model.
+    care_request = _is_care_request(user_request, scheduler)
+    pending = scheduler.pending_tasks()
+
     # --- Guardrail 2: no pets ------------------------------------------------
-    if not scheduler.pets:
+    if care_request and not scheduler.pets:
         logger.info("care_plan: no pets in system")
         return CarePlanResult(
             "no_pets",
@@ -174,8 +300,7 @@ def generate_care_plan(
         )
 
     # --- Guardrail 3: nothing scheduled --------------------------------------
-    pending = scheduler.pending_tasks()
-    if not pending:
+    if care_request and not pending:
         logger.info("care_plan: no pending tasks")
         return CarePlanResult(
             "no_tasks",
@@ -227,7 +352,7 @@ def generate_care_plan(
     try:
         response = client.models.generate_content(
             model=model,
-            contents=_build_user_message(user_request, context),
+            contents=_build_user_message(user_request, context, history),
             # Passed as a plain dict so no extra SDK types are needed here.
             config={
                 "system_instruction": SYSTEM_PROMPT,
@@ -238,6 +363,15 @@ def generate_care_plan(
     except Exception as exc:  # any SDK/network/auth error must not crash the app
         # Log the exception type but keep the user-facing text generic and safe.
         logger.exception("care_plan: AI call failed (%s)", type(exc).__name__)
+        detail = str(exc)
+        if "RESOURCE_EXHAUSTED" in detail or "429" in detail:
+            # Free-tier daily/minute quota reached — tell the user plainly.
+            return CarePlanResult(
+                "error",
+                "The AI assistant has reached its free usage limit for now. "
+                "Please wait a little and try again — the free quota resets over "
+                "time (or add billing to your Gemini API key for higher limits).",
+            )
         return CarePlanResult(
             "error",
             "Sorry — I couldn't reach the AI assistant just now. Please check "
